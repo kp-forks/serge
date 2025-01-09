@@ -1,47 +1,13 @@
 # ---------------------------------------
-# Base image for node
-FROM node:19-slim as node_base
-
-WORKDIR /usr/src/app
-
-# ---------------------------------------
-# Base image for runtime
-FROM python:3.11-slim as base
-
-ENV TZ=Etc/UTC
-WORKDIR /usr/src/app
-
-# Install Redis
-RUN apt-get update \
-    && apt-get install -y curl wget gnupg cmake lsb-release build-essential \
-    && curl -fsSL https://packages.redis.io/gpg | gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg \
-    && echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/redis.list \
-    && apt-get update \
-    && apt-get install -y redis \
-    && mkdir -p /etc/redis /var/redis \
-    && pip install --upgrade pip
-
-# Add redis config
-COPY ./config/redis.conf /etc/redis/redis.conf
-
-# ---------------------------------------
-# Dev environment
-FROM base as dev
-ENV NODE_ENV='development'
-
-# Install Node.js and npm packages
-COPY --from=node_base /usr/local /usr/local
-COPY ./web/package*.json ./
-RUN npm ci
-
-COPY --chmod=0755 scripts/dev.sh /usr/src/app/dev.sh
-CMD ./dev.sh
+# Base image for redis
+FROM redis:7-bookworm as redis
 
 # ---------------------------------------
 # Build frontend
-FROM node_base as frontend_builder
+FROM node:20-bookworm-slim as frontend
 
-COPY ./web/package*.json ./
+WORKDIR /usr/src/app
+COPY ./web/package.json ./web/package-lock.json ./
 RUN npm ci
 
 COPY ./web /usr/src/app/web/
@@ -50,16 +16,38 @@ RUN npm run build
 
 # ---------------------------------------
 # Runtime environment
-FROM base as release
+FROM python:3.11-slim-bookworm as release
 
+# Set ENV
 ENV NODE_ENV='production'
+ENV TZ=Etc/UTC
 WORKDIR /usr/src/app
 
-COPY --from=frontend_builder /usr/src/app/web/build /usr/src/app/api/static/
+# Copy artifacts
+COPY --from=redis /usr/local/bin/redis-server /usr/local/bin/redis-server
+COPY --from=redis /usr/local/bin/redis-cli /usr/local/bin/redis-cli
+COPY --from=frontend /usr/src/app/web/build /usr/src/app/api/static/
 COPY ./api /usr/src/app/api
-COPY --chmod=0755 scripts/deploy.sh /usr/src/app/deploy.sh
+COPY scripts/deploy.sh /usr/src/app/deploy.sh
+COPY scripts/serge.env /usr/src/app/serge.env
+COPY vendor/requirements.txt /usr/src/app/requirements.txt
 
-RUN pip install --no-cache-dir ./api
+# Install api dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends dumb-init libgomp1 musl-dev \
+    && pip install --no-cache-dir ./api \
+    && pip install -r /usr/src/app/requirements.txt \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* \
+    && chmod 755 /usr/src/app/deploy.sh \
+    && chmod 755 /usr/local/bin/redis-server \
+    && chmod 755 /usr/local/bin/redis-cli \
+    && mkdir -p /etc/redis \
+    && mkdir -p /data/db \
+    && mkdir -p /usr/src/app/weights \
+    && echo "appendonly yes" >> /etc/redis/redis.conf \
+    && echo "dir /data/db/" >> /etc/redis/redis.conf \ 
+    && ln -s /usr/lib/x86_64-linux-musl/libc.so /lib/libc.musl-x86_64.so.1
 
 EXPOSE 8008
-CMD ./deploy.sh
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ["/bin/bash", "-c", "/usr/src/app/deploy.sh"]

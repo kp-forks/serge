@@ -1,45 +1,76 @@
-from fastapi import APIRouter
+import os
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from langchain.memory import RedisChatMessageHistory
-from langchain.schema import SystemMessage, messages_to_dict, AIMessage, HumanMessage
+from langchain.schema import AIMessage, HumanMessage, SystemMessage, messages_to_dict
 from llama_cpp import Llama
 from loguru import logger
 from redis import Redis
-from sse_starlette.sse import EventSourceResponse
-
+from serge.crud import create_chat, remove_chat, update_user
+from serge.database import SessionLocal
 from serge.models.chat import Chat, ChatParameters
+from serge.routers.auth import get_current_active_user
+from serge.schema.user import Chat as UserChat
+from serge.schema.user import User
 from serge.utils.stream import get_prompt
-
-import uuid
-
+from sqlalchemy.orm import Session
+from sse_starlette.sse import EventSourceResponse
 
 chat_router = APIRouter(
     prefix="/chat",
     tags=["chat"],
 )
 
+unauth_error = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Unauthorized",
+    headers={"WWW-Authenticate": "Bearer"},
+)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _try_get_chat(client, chat_id):
+    if not client.sismember("chats", chat_id):
+        raise ValueError("Chat does not exist")
+
+    chat_raw = client.get(f"chat:{chat_id}")
+    chat = Chat.parse_raw(chat_raw)
+
+    # backwards compat
+    if not hasattr(chat, "owner"):
+        chat.owner = "system"
+
+    return chat
+
 
 @chat_router.post("/")
 async def create_new_chat(
+    u: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
     model: str = "7B",
     temperature: float = 0.1,
     top_k: int = 50,
     top_p: float = 0.95,
-    max_length: int = 256,
-    context_window: int = 512,
+    max_length: int = 2048,
+    context_window: int = 2048,
+    gpu_layers: Optional[int] = None,
     repeat_last_n: int = 64,
     repeat_penalty: float = 1.3,
     init_prompt: str = "Below is an instruction that describes a task. Write a response that appropriately completes the request.",
     n_threads: int = 4,
 ):
-    try:
-        client = Llama(
-            model_path="/usr/src/app/weights/" + model + ".bin",
-        )
-        del client
-    except Exception as exc:
-        raise ValueError(f"Model can't be found: {exc}")
+    if not os.path.exists(f"/usr/src/app/weights/{model}.bin"):
+        raise ValueError(f"Model can't be found: /usr/src/app/weights/{model}.bin")
 
-    client = Redis()
+    client = Redis(host="localhost", port=6379, decode_responses=False)
 
     params = ChatParameters(
         model_path=model,
@@ -48,16 +79,22 @@ async def create_new_chat(
         top_p=top_p,
         max_tokens=max_length,
         n_ctx=context_window,
+        n_gpu_layers=gpu_layers,
         last_n_tokens_size=repeat_last_n,
         repeat_penalty=repeat_penalty,
         n_threads=n_threads,
         init_prompt=init_prompt,
     )
     # create the chat
-    chat = Chat(params=params)
+    chat = Chat(owner=u.username, params=params)
 
     # store the parameters
     client.set(f"chat:{chat.id}", chat.json())
+
+    uc = UserChat(chat_id=chat.id, owner=u.username)
+    create_chat(db, uc)
+    u.chats.append(uc)
+    update_user(db, u)
 
     # create the message history
     history = RedisChatMessageHistory(chat.id)
@@ -70,14 +107,11 @@ async def create_new_chat(
 
 
 @chat_router.get("/")
-async def get_all_chats():
+async def get_all_chats(u: User = Depends(get_current_active_user)):
     res = []
-    client = Redis()
-
-    ids = client.smembers("chats")
 
     chats = sorted(
-        [await get_specific_chat(id.decode()) for id in ids],
+        [await get_specific_chat(x.chat_id, u) for x in u.chats],
         key=lambda x: x["created"],
         reverse=True,
     )
@@ -100,85 +134,70 @@ async def get_all_chats():
 
 
 @chat_router.get("/{chat_id}")
-async def get_specific_chat(chat_id: str):
-    client = Redis()
+async def get_specific_chat(chat_id: str, u: User = Depends(get_current_active_user)):
+    client = Redis(host="localhost", port=6379, decode_responses=False)
 
-    if not client.sismember("chats", chat_id):
-        raise ValueError("Chat does not exist")
+    if chat_id not in [x.chat_id for x in u.chats]:
+        raise unauth_error
 
-    chat_raw = client.get(f"chat:{chat_id}")
-    chat = Chat.parse_raw(chat_raw)
+    chat = _try_get_chat(client, chat_id)
 
     history = RedisChatMessageHistory(chat.id)
-
     chat_dict = chat.dict()
     chat_dict["history"] = messages_to_dict(history.messages)
     return chat_dict
 
 
 @chat_router.get("/{chat_id}/history")
-async def get_chat_history(chat_id: str):
-    client = Redis()
-
-    if not client.sismember("chats", chat_id):
-        raise ValueError("Chat does not exist")
+async def get_chat_history(chat_id: str, u: User = Depends(get_current_active_user)):
+    if chat_id not in [x.chat_id for x in u.chats]:
+        raise unauth_error
 
     history = RedisChatMessageHistory(chat_id)
     return messages_to_dict(history.messages)
 
 
-@chat_router.delete("/{chat_id}/prompt")
-async def delete_prompt(chat_id: str, content: str, id: str):
-    client = Redis()
+@chat_router.post("/{chat_id}/prompt")
+async def delete_or_stop_prompt(chat_id: str, idx: int, u: User = Depends(get_current_active_user)):
+    if idx < 0:
+        raise ValueError("Index cannot be negative")
 
-    if not client.sismember("chats", chat_id):
-        raise ValueError("Chat does not exist")
+    if chat_id not in [x.chat_id for x in u.chats]:
+        raise unauth_error
 
     history = RedisChatMessageHistory(chat_id)
+    client = Redis(host="localhost", port=6379, decode_responses=False)
 
-    deleted = False
-    old_messages = history.messages.copy()
-    old_messages.reverse()
-    new_messages = []
+    if idx >= len(history.messages):
+        client.set(f"stop_generation:{chat_id}", "1", ex=10)
+        if client.get(f"has_generated:{chat_id}"):
+            client.delete(f"has_generated:{chat_id}")
+            logger.info("Stopping response generation")
+            return {"message": "Stopping response generation"}
+        else:
+            logger.info("Preventing response generation")
+            return {"message": "Preventing response generation"}
 
-    if len(content) > 0:
-        logger.debug(f"DELETE content:{content}")
-        for message in old_messages:
-            test_content = message.content.replace("\n", "").replace("+", " ")
-            if not test_content.startswith(content) or deleted:
-                new_messages.append(message)
-            elif test_content.startswith(content) and not deleted:
-                deleted = True
-    elif len(id) > 0:
-        logger.debug(f"DELETE id:{id}")
-        for message in old_messages:
-            if not message.additional_kwargs.get("id") == id:
-                new_messages.append(message)
-            elif message.additional_kwargs.get("id") == id and not deleted:
-                deleted = True
-    elif len(old_messages) > 0:
-        logger.debug("DELETE last message")
-        new_messages = old_messages[1:]
+    messages = history.messages.copy()[:idx]
+    history.clear()
 
-    if len(new_messages) == len(old_messages):
-        raise ValueError("Prompt not deleted")
-
-    new_messages.reverse()
-
-    if len(new_messages) > 0:
-        history.clear()
-        for new_message in new_messages:
-            history.append(new_message)
+    for message in messages:
+        history.append(message)
 
     return True
 
 
 @chat_router.delete("/{chat_id}")
-async def delete_chat(chat_id: str):
-    client = Redis()
+async def delete_chat(chat_id: str, u: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    client = Redis(host="localhost", port=6379, decode_responses=False)
+    if chat_id not in [x.chat_id for x in u.chats]:
+        raise unauth_error
 
     if not client.sismember("chats", chat_id):
         raise ValueError("Chat does not exist")
+
+    if cid := next((x for x in u.chats if x.chat_id == chat_id), None):
+        remove_chat(db, cid)
 
     RedisChatMessageHistory(chat_id).clear()
 
@@ -188,35 +207,44 @@ async def delete_chat(chat_id: str):
     return True
 
 
+@chat_router.delete("/delete/all")
+async def delete_all_chats(u: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    [delete_chat(x.chat_id, u, db) for x in u.chats]
+    return True
+
+
 @chat_router.get("/{chat_id}/question")
-def stream_ask_a_question(chat_id: str, prompt: str):
-    logger.debug("Starting redis client")
-    client = Redis()
+async def stream_ask_a_question(chat_id: str, prompt: str, u: User = Depends(get_current_active_user)):
+    if chat_id not in [x.chat_id for x in u.chats]:
+        raise unauth_error
+
+    logger.info("Starting redis client")
+
+    client = Redis(host="localhost", port=6379, decode_responses=False)
 
     if not client.sismember("chats", chat_id):
         raise ValueError("Chat does not exist")
 
     logger.debug("creating chat")
-    chat_raw = client.get(f"chat:{chat_id}")
-    chat = Chat.parse_raw(chat_raw)
+    chat = _try_get_chat(client, chat_id)
 
     logger.debug(chat.params)
     logger.debug("creating history")
     history = RedisChatMessageHistory(chat.id)
 
-    human_uuid = str(uuid.uuid4())
     if len(prompt) > 0:
         logger.debug(f"adding question {prompt}")
-        human_message = HumanMessage(content=prompt, additional_kwargs={"id": human_uuid})
+        human_message = HumanMessage(content=prompt)
         history.append(message=human_message)
     prompt = get_prompt(history, chat.params)
     prompt += "### Response:\n"
 
     logger.debug("creating Llama client")
     try:
-        client = Llama(
-            model_path="/usr/src/app/weights/" + chat.params.model_path + ".bin",
+        llama_client = Llama(
+            model_path=f"/usr/src/app/weights/{chat.params.model_path}.bin",
             n_ctx=len(chat.params.init_prompt) + chat.params.n_ctx,
+            n_gpu_layers=chat.params.n_gpu_layers,
             n_threads=chat.params.n_threads,
             last_n_tokens_size=chat.params.last_n_tokens_size,
         )
@@ -226,16 +254,16 @@ def stream_ask_a_question(chat_id: str, prompt: str):
         history.append(SystemMessage(content=error))
         return {"event": "error"}
 
+    # Following logic triggers if deleting before any tokens are generated
+    if client.get(f"stop_generation:{chat_id}"):
+        client.delete(f"stop_generation:{chat_id}")
+        return {"event": "close"}
+
     def event_generator():
-        yield {"event": "human_id", "data": human_uuid}
-
-        ai_uuid = str(uuid.uuid4())
-        yield {"event": "ai_id", "data": ai_uuid}
-
         full_answer = ""
         error = None
         try:
-            for output in client(
+            for output in llama_client(
                 prompt,
                 stream=True,
                 temperature=chat.params.temperature,
@@ -244,23 +272,30 @@ def stream_ask_a_question(chat_id: str, prompt: str):
                 repeat_penalty=chat.params.repeat_penalty,
                 max_tokens=chat.params.max_tokens,
             ):
+                if client.get(f"stop_generation:{chat_id}"):
+                    logger.info("Generation stopped by user")
+                    client.delete(f"stop_generation:{chat_id}")
+                    break
+                elif not client.get(f"has_generated:{chat_id}"):
+                    client.set(f"has_generated:{chat_id}", "1")
                 txt = output["choices"][0]["text"]
                 full_answer += txt
                 yield {"event": "message", "data": txt}
 
         except Exception as e:
-            if type(e) == UnicodeDecodeError:
+            if type(e) is UnicodeDecodeError:
                 pass
             else:
                 error = e.__str__()
                 logger.error(error)
                 yield ({"event": "error"})
         finally:
+            client.delete(f"has_generated:{chat_id}")
             if error:
                 history.append(SystemMessage(content=error))
-            else:
+            elif full_answer:
                 logger.info(full_answer)
-                ai_message = AIMessage(content=full_answer, additional_kwargs={"id": ai_uuid})
+                ai_message = AIMessage(content=full_answer)
                 history.append(message=ai_message)
             yield ({"event": "close"})
 
@@ -268,20 +303,20 @@ def stream_ask_a_question(chat_id: str, prompt: str):
 
 
 @chat_router.post("/{chat_id}/question")
-async def ask_a_question(chat_id: str, prompt: str):
-    client = Redis()
+async def ask_a_question(chat_id: str, prompt: str, u: User = Depends(get_current_active_user)):
+    if chat_id not in [x.chat_id for x in u.chats]:
+        raise unauth_error
+
+    client = Redis(host="localhost", port=6379, decode_responses=False)
 
     if not client.sismember("chats", chat_id):
         raise ValueError("Chat does not exist")
 
-    chat_raw = client.get(f"chat:{chat_id}")
-    chat = Chat.parse_raw(chat_raw)
-
+    chat = _try_get_chat(client, chat_id)
     history = RedisChatMessageHistory(chat.id)
 
     if len(prompt) > 0:
-        uuid_str = str(uuid.uuid4())
-        human_message = HumanMessage(content=prompt, additional_kwargs={"id": uuid_str})
+        human_message = HumanMessage(content=prompt)
         history.append(message=human_message)
 
     prompt = get_prompt(history, chat.params)
@@ -289,9 +324,10 @@ async def ask_a_question(chat_id: str, prompt: str):
 
     try:
         client = Llama(
-            model_path="/usr/src/app/weights/" + chat.params.model_path + ".bin",
+            model_path=f"/usr/src/app/weights/{chat.params.model_path}.bin",
             n_ctx=len(chat.params.init_prompt) + chat.params.n_ctx,
             n_threads=chat.params.n_threads,
+            n_gpu_layers=chat.params.n_gpu_layers,
             last_n_tokens_size=chat.params.last_n_tokens_size,
         )
         answer = client(
@@ -302,6 +338,9 @@ async def ask_a_question(chat_id: str, prompt: str):
             repeat_penalty=chat.params.repeat_penalty,
             max_tokens=chat.params.max_tokens,
         )
+        full_answer = ""
+        if len(answer.get("choices", [])) > 0:
+            full_answer = answer["choices"][0].get("text", "")
     except Exception as e:
         error = e.__str__()
         logger.error(error)
@@ -311,7 +350,6 @@ async def ask_a_question(chat_id: str, prompt: str):
     if not isinstance(answer, str):
         answer = str(answer)
 
-    uuid_str = str(uuid.uuid4())
-    ai_message = AIMessage(content=answer, additional_kwargs={"id": uuid_str})
+    ai_message = AIMessage(content=full_answer)
     history.append(message=ai_message)
     return answer
